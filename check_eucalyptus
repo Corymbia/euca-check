@@ -1,0 +1,271 @@
+#!/bin/bash
+
+EUCA_RESULT=""
+EUCA_COMPONENTS=""
+EUCA_VERSION="UNSET"
+RETURNCODE=0
+FAILCODE=0
+VERBOSE=0
+
+vecho() {
+    if [ "$VERBOSE" -ne 0 ]; then
+	echo "VERBOSE: $1"
+    fi
+}
+
+set_failcodes() {
+    FAILCODES[0]="Healthy."
+    FAILCODES[1]="Eucalyptus not installed on this host."
+    FAILCODES[2]="Expected Eucalyptus process not running."
+    FAILCODES[3]="FATAL detected in logfile ($FAILLOG)."
+    FAILCODES[4]="ERROR detected in logfile ($FAILLOG)."
+    FAILCODES[5]="WARN detected in logfile ($FAILLOG)."
+    FAILCODES[6]="Expected port (${FAILPORT}) not in LISTEN."
+    FAILCODES[7]="Fault log entry detected ($FAILLOG)."
+}
+
+discover_components() {
+    vecho "checking for existance of /etc/eucalyptus/eucalyptus-version"
+    if [ ! -f /etc/eucalyptus/eucalyptus-version ]; then
+	FAILCODE=1
+	EUCA_VERSION="NONE"
+	EUCA_COMPONENTS=" NONE"
+	do_exit
+    else
+	EUCA_VERSION=`cat /etc/eucalyptus/eucalyptus-version 2>/dev/null`
+	vecho "found euca version: $EUCA_VERSION"
+    fi
+
+    
+    vecho "checking for package: rpm -q eucalyptus-cloud"
+    if ( rpm -q eucalyptus-cloud >/dev/null 2>&1 ); then
+	EUCA_COMPONENTS="$EUCA_COMPONENTS CLC"
+    fi
+
+    vecho "checking for package: rpm -q eucalyptus-walrus"
+    if ( rpm -q eucalyptus-walrus >/dev/null 2>&1 ); then
+	EUCA_COMPONENTS="$EUCA_COMPONENTS WALRUS"
+    fi
+    
+    vecho "checking for package: rpm -q eucalyptus-sc"
+    if ( rpm -q eucalyptus-sc >/dev/null 2>&1 ); then
+	EUCA_COMPONENTS="$EUCA_COMPONENTS SC"
+    fi
+
+    vecho "checking for package: rpm -q eucalyptus-cc"
+    if ( rpm -q eucalyptus-cc >/dev/null 2>&1 ); then
+	EUCA_COMPONENTS="$EUCA_COMPONENTS CC"
+    fi
+
+    vecho "checking for package: rpm -q eucalyptus-nc"
+    if ( rpm -q eucalyptus-nc >/dev/null 2>&1 ); then
+	EUCA_COMPONENTS="$EUCA_COMPONENTS NC"
+    fi
+
+    return 0
+}
+
+check_euca_port() {
+    local EUCA_PORT=$1
+
+    vecho "checking for port: netstat -tnl | grep ${EUCA_PORT}"
+    if ( ! netstat -tnl | grep ${EUCA_PORT} >/dev/null 2>&1 ); then
+	FAILPORT=$EUCA_PORT
+	FAILCODE=6
+	do_exit
+    fi
+}
+
+check_faults() {
+    local FAULTFILE=$1
+
+    vecho "checking for non-empty faultfile: $FAULTFILE"
+    if [ -s "$FAULTFILE" ]; then
+	FAILCODE=7
+	FAILLOG=$FAULTFILE
+	do_exit
+    fi
+}
+
+check_be_logfiles_time_window() {
+    local LOGFILE=$1
+    local CURRLAST=`tail -n 1 $LOGFILE | awk '{print $1, $2}'`
+    if [ -f /tmp/check_eucalyptus_logstate ]; then
+	LASTLAST=`cat /tmp/check_eucalyptus_logstate | grep LASTLAST | awk '{print $2,$3}'`
+    else
+	LASTLAST=`head -n 1 $LOGFILE | awk '{print $1, $2}'`
+    fi
+
+    vecho "checking for FATAL: grep \"$LASTLAST\" $LOGFILE -A9999999 | grep 'FATAL'"
+    if ( grep "$LASTLAST" $LOGFILE -A9999999 | grep 'FATAL' >/dev/null 2>&1 ); then
+	vecho "found FATAL between $CURRLAST and $LASTLAST"
+	echo "FATAL between $LASTLAST and $CURRLAST in $LOGFILE" >> /tmp/check_eucalyptus_logstate.fatal
+    fi
+    
+    vecho "checking for ERROR: grep \"$LASTLAST\" $LOGFILE -A9999999 | grep 'ERROR'"
+    if ( grep "$LASTLAST" $LOGFILE -A9999999 | grep 'ERROR' >/dev/null 2>&1 ); then
+	vecho "found ERROR between $CURRLAST and $LASTLAST"
+	echo "ERROR between $LASTLAST and $CURRLAST in $LOGFILE" >> /tmp/check_eucalyptus_logstate.error
+    fi
+
+    vecho "checking for WARN: grep \"$LASTLAST\" $LOGFILE -A9999999 | grep 'WARN'"
+    if ( grep "$LASTLAST" $LOGFILE -A9999999 | grep 'WARN' >/dev/null 2>&1 ); then
+	vecho "found WARN between $CURRLAST and $LASTLAST"
+	echo "WARN between $LASTLAST and $CURRLAST in $LOGFILE" >> /tmp/check_eucalyptus_logstate.warn
+    fi
+	
+    echo "LASTLAST $CURRLAST" > /tmp/check_eucalyptus_logstate
+
+    if [ -f /tmp/check_eucalyptus_logstate.fatal ]; then
+	FAILCODE=3
+	FAILLOG=$LOGFILE
+	do_exit
+    fi
+
+    if [ -f /tmp/check_eucalyptus_logstate.error ]; then
+	FAILCODE=4
+	FAILLOG=$LOGFILE
+	do_exit
+    fi
+
+#    if [ -f /tmp/check_eucalyptus_logstate.warn ]; then
+#	FAILCODE=5
+#	FAILLOG=$LOGFILE
+#	do_exit
+#    fi
+}
+
+check_be_logfiles() {
+    local LOGFILE=$1
+
+    check_logfiles_time_window "$LOGFILE"
+
+    vecho "checking for FATAL logentries: tail -n 5000 ${LOGFILE} | grep 'FATAL'"
+    if ( tail -n 5000 ${LOGFILE} | grep "FATAL" >/dev/null 2>&1 ); then
+	FAILCODE=3
+	FAILLOG=$LOGFILE
+	do_exit
+    fi
+
+    vecho "checking for ERROR logentries: tail -n 5000 ${LOGFILE} | grep 'ERROR'"
+    if ( tail -n 5000 ${LOGFILE} | grep "ERROR" >/dev/null 2>&1 ); then
+	FAILCODE=4
+	FAILLOG=$LOGFILE
+	do_exit
+    fi
+
+    vecho "checking for WARN logentries: tail -n 5000 ${LOGFILE} | grep 'WARN'"
+    if ( tail -n 5000 ${LOGFILE} | grep "WARN" >/dev/null 2>&1 ); then
+	FAILCODE=5
+	FAILLOG=$LOGFILE
+	do_exit
+    fi	
+}
+
+check_NC() {
+    vecho "check_NC() called"
+
+    vecho "checking for process: ps ax | grep httpd-nc.conf | grep -v grep"
+    if ( ! ps ax | grep httpd-nc.conf | grep -v grep >/dev/null 2>&1 ); then
+	FAILCODE=2
+	do_exit
+    fi
+
+    check_euca_port "8775"
+    check_faults "/var/log/eucalyptus/nc-fault.log"
+    check_be_logfiles_time_window "/var/log/eucalyptus/nc.log"
+
+    vecho "check_NC() done"
+}
+
+check_CC() {
+    vecho "check_CC() called"
+
+    vecho "checking for process: ps ax | grep httpd-cc.conf | grep -v grep"
+    if ( ! ps ax | grep httpd-cc.conf | grep -v grep >/dev/null 2>&1 ); then
+	FAILCODE=2
+	do_exit
+    fi
+
+    check_euca_port "8774"
+    check_faults "/var/log/eucalyptus/cc-fault.log"
+    check_be_logfiles_time_window "/var/log/eucalyptus/cc.log"
+
+    vecho "check_CC() done"
+}
+
+check_CLC() {
+    vecho "check_CLC() called"
+
+    vecho "checking for process: ps ax | grep eucalyptus-cloud | grep -v grep"
+    if ( ! ps ax | grep eucalyptus-cloud | grep -v grep >/dev/null 2>&1 ); then
+	FAILCODE=2
+	do_exit
+    fi
+    
+    check_euca_port "8773"
+    check_faults "/var/log/eucalyptus/cloud-fault.log"
+
+    vecho "check_CLC() done"
+}
+
+check_WALRUS() {
+    vecho "check_WALRUS() called"
+
+    vecho "checking for process: ps ax | grep eucalyptus-cloud | grep -v grep"
+    if ( ! ps ax | grep eucalyptus-cloud | grep -v grep >/dev/null 2>&1 ); then
+	FAILCODE=2
+	do_exit
+    fi
+
+    check_euca_port "8773"
+    check_faults "/var/log/eucalyptus/walrus-fault.log"
+
+    vecho "check_WALRUS() done"
+}
+
+check_SC() {
+    vecho "check_SC() called"
+
+    vecho "checking for process: ps ax | grep eucalyptus-cloud | grep -v grep"
+    if ( ! ps ax | grep eucalyptus-cloud | grep -v grep >/dev/null 2>&1 ); then
+	FAILCODE=2
+	do_exit
+    fi
+
+    check_euca_port "8773"
+    check_faults "/var/log/eucalyptus/sc-fault.log"
+
+    vecho "check_SC() done"
+}
+
+do_exit() {
+    set_failcodes
+    case $FAILCODE in
+	0) EUCA_RESULT=""; if [ "$RETURNCODE" -le 0 ]; then RETURNCODE=0; fi;;
+	1) EUCA_RESULT="$EUCA_RESULT | ${FAILCODES[$FAILCODE]}"; if [ "$RETURNCODE" -le 2 ]; then RETURNCODE=2; fi;;
+	2) EUCA_RESULT="$EUCA_RESULT | ${FAILCODES[$FAILCODE]}"; if [ "$RETURNCODE" -le 2 ]; then RETURNCODE=2; fi;;
+	3) EUCA_RESULT="$EUCA_RESULT | ${FAILCODES[$FAILCODE]}"; if [ "$RETURNCODE" -le 2 ]; then RETURNCODE=2; fi;;
+	4) EUCA_RESULT="$EUCA_RESULT | ${FAILCODES[$FAILCODE]}"; if [ "$RETURNCODE" -le 2 ]; then RETURNCODE=2; fi;;
+	5) EUCA_RESULT="$EUCA_RESULT | ${FAILCODES[$FAILCODE]}"; if [ "$RETURNCODE" -le 1 ]; then RETURNCODE=1; fi;;
+	6) EUCA_RESULT="$EUCA_RESULT | ${FAILCODES[$FAILCODE]}"; if [ "$RETURNCODE" -le 2 ]; then RETURNCODE=2; fi;;
+	7) EUCA_RESULT="$EUCA_RESULT | ${FAILCODES[$FAILCODE]}"; if [ "$RETURNCODE" -le 2 ]; then RETURNCODE=2; fi;;
+    esac
+}
+
+discover_components
+for component in $EUCA_COMPONENTS
+do
+    vecho "checking $component health"
+    check_${component}
+done
+
+STATUS="UNKNOWN:"
+case $RETURNCODE in
+    0) STATUS="OK:${EUCA_COMPONENTS} | Healthy.";;
+    1) STATUS="WARNING:${EUCA_COMPONENTS}${EUCA_RESULT}";;
+    2) STATUS="CRITICAL:${EUCA_COMPONENTS}${EUCA_RESULT}";;
+esac
+echo "$STATUS"
+exit $RETURNCODE
+
